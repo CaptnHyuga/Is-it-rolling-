@@ -8,7 +8,13 @@
 #include <gui/gui.h>
 #include <input/input.h>
 #include <notification/notification_messages.h>
+
+/* Compatibility fix for header path changes across firmware versions */
+#if __has_include(<lib/subghz/devices/subghz_devices.h>)
+#include <lib/subghz/devices/subghz_devices.h>
+#elif __has_include(<lib/subghz/devices/devices.h>)
 #include <lib/subghz/devices/devices.h>
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,7 +25,7 @@
 #define MAX_PRESSES     8
 #define DEFAULT_PRESSES 5
 
-#define MAX_PULSES       256 /* Reduced for RAM safety */
+#define MAX_PULSES       256
 #define MAX_CHIPS        512
 #define MIN_FRAME_PULSES 20
 #define FRAME_GAP_US     8000
@@ -112,7 +118,8 @@ static void rx_start(App* a) {
     subghz_devices_reset(a->device);
     subghz_devices_idle(a->device);
 
-    FuriHalSubGhzPreset preset = a->fm ? FuriHalSubGhzPreset2FSKDev476Async : FuriHalSubGhzPresetOok650Async;
+    /* Use OOK650 and 2FSK476 presets */
+    uint32_t preset = a->fm ? FuriHalSubGhzPreset2FSKDev476Async : FuriHalSubGhzPresetOok650Async;
     subghz_devices_load_preset(a->device, preset, NULL);
 
     subghz_devices_set_frequency(a->device, freq);
