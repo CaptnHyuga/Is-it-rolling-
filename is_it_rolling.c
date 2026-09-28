@@ -19,6 +19,7 @@
 #include <gui/gui.h>
 #include <input/input.h>
 #include <notification/notification_messages.h>
+#include <lib/subghz/devices/cc1101_configs.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -120,16 +121,23 @@ static void rx_capture_cb(bool level, uint32_t duration, void* ctx) {
 
 static void rx_start(App* a) {
     uint32_t freq = freq_list[a->freq_idx];
-    furi_stream_buffer_reset(a->stream);
+    {
+        uint32_t discard;
+        while(furi_stream_buffer_receive(a->stream, &discard, sizeof(discard), 0) ==
+              sizeof(discard)) {
+        }
+    }
 
     furi_hal_subghz_reset();
     furi_hal_subghz_idle();
-    furi_hal_subghz_load_preset(
-        a->fm ? FuriHalSubGhzPreset2FSKDev476Async : FuriHalSubGhzPresetOok650Async);
+    furi_hal_subghz_load_custom_preset(
+        a->fm ? subghz_device_cc1101_preset_2fsk_dev47_6khz_async_regs :
+                subghz_device_cc1101_preset_ook_650khz_async_regs);
     furi_hal_subghz_set_frequency_and_path(freq);
     furi_hal_subghz_flush_rx();
     furi_hal_subghz_rx();
     furi_hal_subghz_start_async_rx(rx_capture_cb, a);
+    furi_hal_power_insomnia_enter();
     a->rx_active = true;
 }
 
@@ -138,6 +146,7 @@ static void rx_stop(App* a) {
     furi_hal_subghz_stop_async_rx();
     furi_hal_subghz_idle();
     furi_hal_subghz_sleep();
+    furi_hal_power_insomnia_exit();
     a->rx_active = false;
 }
 
@@ -361,7 +370,7 @@ static void fmt_freq(char* buf, size_t n, uint32_t f) {
 }
 
 static void draw_setup(Canvas* c, App* a) {
-    char buf[40], fb[16];
+    char buf[48], fb[32];
     canvas_set_font(c, FontPrimary);
     canvas_draw_str_aligned(c, 64, 1, AlignCenter, AlignTop, "Is it rolling ?");
     canvas_set_font(c, FontSecondary);
@@ -388,7 +397,7 @@ static void draw_setup(Canvas* c, App* a) {
 }
 
 static void draw_listen(Canvas* c, App* a) {
-    char buf[48], fb[16];
+    char buf[64], fb[32];
     fmt_freq(fb, sizeof(fb), freq_list[a->freq_idx]);
 
     canvas_set_font(c, FontPrimary);
@@ -410,7 +419,7 @@ static void draw_listen(Canvas* c, App* a) {
 }
 
 static void draw_result(Canvas* c, App* a) {
-    char buf[48];
+    char buf[64];
     const Analysis* r = &a->res;
 
     canvas_set_font(c, FontSecondary);
@@ -484,7 +493,7 @@ static bool handle_input(App* a, const InputEvent* e) {
         } else if(e->key == InputKeyLeft || e->key == InputKeyRight) {
             int dir = (e->key == InputKeyRight) ? 1 : -1;
             if(a->cursor == 0) {
-                a->freq_idx = (a->freq_idx + FREQ_COUNT + dir) % FREQ_COUNT;
+                a->freq_idx = (uint8_t)((a->freq_idx + (int)FREQ_COUNT + dir) % (int)FREQ_COUNT);
             } else if(a->cursor == 1) {
                 a->fm = !a->fm;
             } else {
@@ -542,6 +551,7 @@ int32_t is_it_rolling_app(void* p) {
     UNUSED(p);
 
     App* a = malloc(sizeof(App));
+    furi_check(a);
     memset(a, 0, sizeof(App));
     a->screen = ScreenSetup;
     a->freq_idx = FREQ_DEFAULT_IDX;
