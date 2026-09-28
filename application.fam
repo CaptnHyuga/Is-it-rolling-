@@ -7,5 +7,8 @@ App(
     stack_size=4 * 1024,
     fap_category="Sub-GHz",
     fap_version="1.0",
+    fap_icon="icon.png",  # Ensure an icon.png exists in your repo root or set to standard icon
     fap_description="Listen-only: press the same remote button N times and estimate if it uses a rolling code.",
+    fap_author="CaptnHyuga",
+    fap_weburl="https://github.com/CaptnHyuga/Is-it-rolling-.git",
 )
