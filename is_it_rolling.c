@@ -11,7 +11,7 @@
  *     bits that change on every press        -> rolling / hopping code
  *
  * There is NO transmit, NO emulation and NOTHING is saved to the SD card.
- * Only stock SDK APIs (furi, furi_hal_subghz, gui, input, notification).
+ * Only stock SDK APIs (furi, subghz_devices, gui, input, notification).
  */
 
 #include <furi.h>
@@ -19,6 +19,8 @@
 #include <gui/gui.h>
 #include <input/input.h>
 #include <notification/notification_messages.h>
+#include <lib/subghz/devices/devices.h>
+#include <lib/subghz/devices/preset.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -94,6 +96,7 @@ typedef struct {
     Analysis res;
 
     /* infrastructure */
+    const SubGhzDevice* device;
     FuriMutex* mutex;
     FuriMessageQueue* queue;
     FuriStreamBuffer* stream;
@@ -122,22 +125,26 @@ static void rx_start(App* a) {
     uint32_t freq = freq_list[a->freq_idx];
     furi_stream_buffer_reset(a->stream);
 
-    furi_hal_subghz_reset();
-    furi_hal_subghz_idle();
-    furi_hal_subghz_load_preset(
-        a->fm ? FuriHalSubGhzPreset2FSKDev476Async : FuriHalSubGhzPresetOok650Async);
-    furi_hal_subghz_set_frequency_and_path(freq);
-    furi_hal_subghz_flush_rx();
-    furi_hal_subghz_rx();
-    furi_hal_subghz_start_async_rx(rx_capture_cb, a);
+    subghz_devices_begin(a->device);
+    subghz_devices_reset(a->device);
+    subghz_devices_idle(a->device);
+    subghz_devices_load_preset(
+        a->device,
+        a->fm ? FuriHalSubGhzPreset2FSKDev476Async : FuriHalSubGhzPresetOok650Async,
+        NULL);
+    subghz_devices_set_frequency(a->device, freq);
+    subghz_devices_flush_rx(a->device);
+    subghz_devices_set_rx(a->device);
+    subghz_devices_start_async_rx(a->device, rx_capture_cb, a);
     a->rx_active = true;
 }
 
 static void rx_stop(App* a) {
     if(!a->rx_active) return;
-    furi_hal_subghz_stop_async_rx();
-    furi_hal_subghz_idle();
-    furi_hal_subghz_sleep();
+    subghz_devices_stop_async_rx(a->device);
+    subghz_devices_idle(a->device);
+    subghz_devices_sleep(a->device);
+    subghz_devices_end(a->device);
     a->rx_active = false;
 }
 
@@ -346,7 +353,7 @@ static void reset_session(App* a) {
 
 static void start_listening(App* a) {
     uint32_t freq = freq_list[a->freq_idx];
-    if(!furi_hal_subghz_is_frequency_valid(freq)) {
+    if(!subghz_devices_is_frequency_valid(a->device, freq)) {
         snprintf(a->status, sizeof(a->status), "Frequency invalid");
         return;
     }
@@ -484,7 +491,7 @@ static bool handle_input(App* a, const InputEvent* e) {
         } else if(e->key == InputKeyLeft || e->key == InputKeyRight) {
             int dir = (e->key == InputKeyRight) ? 1 : -1;
             if(a->cursor == 0) {
-                a->freq_idx = (a->freq_idx + FREQ_COUNT + dir) % FREQ_COUNT;
+                a->freq_idx = (uint8_t)((a->freq_idx + (int)FREQ_COUNT + dir) % (int)FREQ_COUNT);
             } else if(a->cursor == 1) {
                 a->fm = !a->fm;
             } else {
@@ -556,6 +563,9 @@ int32_t is_it_rolling_app(void* p) {
     gui_add_view_port(a->gui, a->vp, GuiLayerFullscreen);
     a->notif = furi_record_open(RECORD_NOTIFICATION);
 
+    subghz_devices_init();
+    a->device = subghz_devices_get_by_name(SUBGHZ_DEVICE_CC1101_INT_NAME);
+
     bool running = true;
     uint32_t last_rssi = 0;
     InputEvent ev;
@@ -570,7 +580,7 @@ int32_t is_it_rolling_app(void* p) {
             if(now - last_rssi > 250) {
                 last_rssi = now;
                 furi_mutex_acquire(a->mutex, FuriWaitForever);
-                if(a->rx_active) a->rssi = furi_hal_subghz_get_rssi();
+                if(a->rx_active) a->rssi = subghz_devices_get_rssi(a->device);
                 furi_mutex_release(a->mutex);
                 view_port_update(a->vp);
             }
@@ -578,6 +588,7 @@ int32_t is_it_rolling_app(void* p) {
     }
 
     rx_stop(a);
+    subghz_devices_deinit();
     gui_remove_view_port(a->gui, a->vp);
     view_port_free(a->vp);
     furi_record_close(RECORD_GUI);

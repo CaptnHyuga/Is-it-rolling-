@@ -11,6 +11,8 @@ Standalone with ufbt:
     ufbt            # builds dist/is_it_rolling.fap
     ufbt launch     # builds, uploads and runs on a connected Flipper
 
+The FlipperFAP web builder (joelewis012.github.io/flipper-fap-actions) only compiles from a Git repo URL containing `application.fam`. Push this folder to your own GitHub repo first and paste that URL. Pick the firmware you run (Official, Momentum or Unleashed).
+
 Or copy the folder into `applications_user/` of the official firmware repo and run `./fbt fap_is_it_rolling`.
 
 ## Use
