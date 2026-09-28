@@ -3,7 +3,7 @@ App(
     name="Is it rolling ?",
     apptype=FlipperAppType.EXTERNAL,
     entry_point="is_it_rolling_app",
-    requires=["gui", "notification"],
+    requires=["gui", "notification", "subghz"],
     stack_size=4 * 1024,
     fap_category="Sub-GHz",
     fap_version="1.0",

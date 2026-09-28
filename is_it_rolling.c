@@ -1,19 +1,26 @@
 /*
- * Is it rolling ? - listen-only Sub-GHz rolling code estimator
+ * Is it rolling ?  -  listen-only Sub-GHz rolling code estimator
+ *
+ * The app tunes the CC1101 to ONE frequency, asks you to press the SAME remote
+ * button N times, captures the first frame of every press as a raw "chip"
+ * sequence (pulse widths quantised to a base time element) and compares the
+ * frames with each other.
+ *
+ *   - frames identical                       -> fixed code
+ *   - stable block + block of random-looking
+ *     bits that change on every press        -> rolling / hopping code
+ *
+ * There is NO transmit, NO emulation and NOTHING is saved to the SD card.
+ * Only stock SDK APIs (furi, subghz_devices, gui, input, notification).
  */
 
 #include <furi.h>
 #include <furi_hal.h>
-#include <furi_hal_subghz.h>
 #include <gui/gui.h>
 #include <input/input.h>
 #include <notification/notification_messages.h>
-
-#if __has_include(<lib/subghz/devices/subghz_devices.h>)
-#include <lib/subghz/devices/subghz_devices.h>
-#elif __has_include(<lib/subghz/devices/devices.h>)
 #include <lib/subghz/devices/devices.h>
-#endif
+#include <lib/subghz/devices/preset.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,11 +31,11 @@
 #define MAX_PRESSES     8
 #define DEFAULT_PRESSES 5
 
-#define MAX_PULSES       256
-#define MAX_CHIPS        512
-#define MIN_FRAME_PULSES 20
-#define FRAME_GAP_US     8000
-#define PRESS_IDLE_MS    500
+#define MAX_PULSES       512 /* pulses kept per frame                      */
+#define MAX_CHIPS        768 /* chips (time-quantised bits) kept per frame */
+#define MIN_FRAME_PULSES 30
+#define FRAME_GAP_US     8000 /* a LOW longer than this ends a frame        */
+#define PRESS_IDLE_MS    500  /* silence needed before a new press counts   */
 
 static const uint32_t freq_list[] = {
     315000000,
@@ -41,8 +48,9 @@ static const uint32_t freq_list[] = {
     915000000,
 };
 #define FREQ_COUNT (sizeof(freq_list) / sizeof(freq_list[0]))
-#define FREQ_DEFAULT_IDX 4
+#define FREQ_DEFAULT_IDX 4 /* 433.92 MHz */
 
+/* ------------------------------ types ----------------------------------- */
 typedef enum {
     ScreenSetup,
     ScreenListen,
@@ -55,7 +63,7 @@ typedef struct {
 } Frame;
 
 typedef struct {
-    int prob;
+    int prob; /* 0..100 */
     uint8_t frames;
     uint16_t len;
     int var_pct;
@@ -64,11 +72,12 @@ typedef struct {
 
 typedef struct {
     Screen screen;
-    uint8_t cursor;
+    uint8_t cursor; /* setup row */
     uint8_t freq_idx;
-    bool fm;
+    bool fm; /* false = AM650, true = FM476 */
     uint8_t target;
 
+    /* capture state */
     bool rx_active;
     bool collecting;
     bool gap_seen;
@@ -86,6 +95,7 @@ typedef struct {
     Frame frames[MAX_PRESSES];
     Analysis res;
 
+    /* infrastructure */
     const SubGhzDevice* device;
     FuriMutex* mutex;
     FuriMessageQueue* queue;
@@ -95,14 +105,16 @@ typedef struct {
     NotificationApp* notif;
 } App;
 
+/* --------------------------- bit helpers -------------------------------- */
 static inline uint8_t get_bit(const Frame* f, uint16_t i) {
     return (f->bits[i >> 3] >> (i & 7)) & 1;
 }
-
 static inline void set_bit(Frame* f, uint16_t i) {
     f->bits[i >> 3] |= (uint8_t)(1 << (i & 7));
 }
 
+/* ----------------------------- radio ------------------------------------ */
+/* Runs in interrupt context: only push the pulse into a stream buffer. */
 static void rx_capture_cb(bool level, uint32_t duration, void* ctx) {
     App* a = ctx;
     uint32_t v = (duration & 0x7FFFFFFFu) | (level ? 0x80000000u : 0u);
@@ -111,19 +123,20 @@ static void rx_capture_cb(bool level, uint32_t duration, void* ctx) {
 
 static void rx_start(App* a) {
     uint32_t freq = freq_list[a->freq_idx];
-    furi_stream_buffer_reset(a->stream);
+    {
+        uint32_t discard;
+        while(furi_stream_buffer_receive(a->stream, &discard, sizeof(discard), 0) ==
+              sizeof(discard)) {
+        }
+    }
 
     subghz_devices_begin(a->device);
     subghz_devices_reset(a->device);
     subghz_devices_idle(a->device);
-
-    /* Clean preset loading compliant with current API */
-    if(a->fm) {
-        subghz_devices_load_preset(a->device, FuriHalSubGhzPreset2FSKDev476Async, NULL);
-    } else {
-        subghz_devices_load_preset(a->device, FuriHalSubGhzPresetOok650Async, NULL);
-    }
-
+    subghz_devices_load_preset(
+        a->device,
+        a->fm ? "FuriHalSubGhzPreset2FSKDev476Async" : "FuriHalSubGhzPresetOok650Async",
+        NULL);
     subghz_devices_set_frequency(a->device, freq);
     subghz_devices_flush_rx(a->device);
     subghz_devices_set_rx(a->device);
@@ -140,17 +153,20 @@ static void rx_stop(App* a) {
     a->rx_active = false;
 }
 
+/* --------------------------- signal analysis ---------------------------- */
 static int cmp_u32(const void* x, const void* y) {
     uint32_t a = *(const uint32_t*)x, b = *(const uint32_t*)y;
     return (a > b) - (a < b);
 }
 
+/* Base time element = 25th percentile of the pulse widths of the frame. */
 static uint32_t estimate_te(App* a) {
     memcpy(a->scratch, a->pulses, a->n_pulses * sizeof(uint32_t));
     qsort(a->scratch, a->n_pulses, sizeof(uint32_t), cmp_u32);
     return a->scratch[a->n_pulses / 4];
 }
 
+/* Reject noise: most pulses must be close to an integer multiple of te. */
 static bool frame_is_clean(const App* a, uint32_t te) {
     uint32_t good = 0;
     for(uint16_t i = 0; i < a->n_pulses; i++) {
@@ -179,6 +195,14 @@ static void build_frame(Frame* f, const uint32_t* d, uint16_t n, uint32_t te) {
     }
 }
 
+/*
+ * Heuristic score. Three pieces of evidence:
+ *  a) how many chip positions change between presses
+ *     (rolling: ~10-80 %, noise: ~0 %, everything: probably different signals)
+ *  b) how "random" the changing zone is (pairwise flip density)
+ *  c) is there a stable block (serial number) that stays identical
+ * Then pulled towards 50 % when only few presses were captured.
+ */
 static void analyze(App* a) {
     Analysis* r = &a->res;
     memset(r, 0, sizeof(*r));
@@ -207,7 +231,7 @@ static void analyze(App* a) {
     r->var_pct = (int)((uint32_t)varc * 100 / len);
     r->fixed_pct = 100 - r->var_pct;
 
-    if(var10 < 10) {
+    if(var10 < 10) { /* frames are (almost) identical -> fixed code */
         r->prob = 3;
         return;
     }
@@ -223,19 +247,19 @@ static void analyze(App* a) {
     uint32_t window = (uint32_t)(last - first + 1) * pairs;
     int density = (int)(diff * 100 / window);
 
-    int sa;
+    int sa; /* amount of variation */
     if(var10 < 50)
-        sa = var10 - 10;
+        sa = var10 - 10; /* 0..40   */
     else if(var10 < 150)
-        sa = 40 + (var10 - 50) * 60 / 100;
+        sa = 40 + (var10 - 50) * 60 / 100; /* 40..100 */
     else if(var10 <= 800)
         sa = 100;
     else
-        sa = 100 - (var10 - 800) * 60 / 200;
+        sa = 100 - (var10 - 800) * 60 / 200; /* 100..40 */
 
-    int sb = density * 10;
+    int sb = density * 10; /* >=10 % flip density -> 100 */
     if(sb > 100) sb = 100;
-    int sc = r->fixed_pct * 100 / 25;
+    int sc = r->fixed_pct * 100 / 25; /* >=25 % stable -> 100 */
     if(sc > 100) sc = 100;
 
     int raw = (40 * sa + 30 * sb + 30 * sc) / 100;
@@ -254,6 +278,7 @@ static void finish_capture(App* a) {
     notification_message(a->notif, &sequence_success);
 }
 
+/* ------------------------- frame / press logic -------------------------- */
 static void finish_frame(App* a) {
     if(a->n_pulses < MIN_FRAME_PULSES) return;
 
@@ -263,18 +288,22 @@ static void finish_frame(App* a) {
 
     uint32_t now = furi_get_tick();
     if(a->have_press && (now - a->last_frame_tick) < PRESS_IDLE_MS) {
+        /* repeat of the frame within the same press: ignore, extend hold */
         a->last_frame_tick = now;
         a->repeats++;
         return;
     }
 
+    /* first frame of a new press */
     if(a->count == 0) a->te = te;
     build_frame(&a->frames[a->count], a->pulses, a->n_pulses, a->te);
     a->count++;
     a->have_press = true;
     a->last_frame_tick = now;
     a->repeats = 0;
-    snprintf(a->status, sizeof(a->status), "Got #%u (%u chips)", a->count, a->frames[a->count - 1].len);
+    snprintf(
+        a->status, sizeof(a->status), "Got #%u (%u chips)", a->count,
+        a->frames[a->count - 1].len);
 
     if(a->count >= a->target) {
         finish_capture(a);
@@ -295,18 +324,18 @@ static void handle_pulse(App* a, bool level, uint32_t dur) {
         return;
     }
 
-    if(!level && dur >= FRAME_GAP_US) {
+    if(!level && dur >= FRAME_GAP_US) { /* end of frame */
         finish_frame(a);
         a->collecting = false;
         a->gap_seen = true;
         return;
     }
-    if(level && dur >= FRAME_GAP_US) {
+    if(level && dur >= FRAME_GAP_US) { /* absurdly long HIGH: noise/carrier */
         a->collecting = false;
         a->gap_seen = false;
         return;
     }
-    if(a->n_pulses >= MAX_PULSES) {
+    if(a->n_pulses >= MAX_PULSES) { /* too long, keep what we have */
         finish_frame(a);
         a->collecting = false;
         a->gap_seen = false;
@@ -338,12 +367,13 @@ static void start_listening(App* a) {
     a->screen = ScreenListen;
 }
 
+/* ------------------------------- UI ------------------------------------- */
 static void fmt_freq(char* buf, size_t n, uint32_t f) {
     snprintf(buf, n, "%lu.%02lu", f / 1000000UL, (f % 1000000UL) / 10000UL);
 }
 
 static void draw_setup(Canvas* c, App* a) {
-    char buf[40], fb[16];
+    char buf[48], fb[32];
     canvas_set_font(c, FontPrimary);
     canvas_draw_str_aligned(c, 64, 1, AlignCenter, AlignTop, "Is it rolling ?");
     canvas_set_font(c, FontSecondary);
@@ -370,7 +400,7 @@ static void draw_setup(Canvas* c, App* a) {
 }
 
 static void draw_listen(Canvas* c, App* a) {
-    char buf[48], fb[16];
+    char buf[64], fb[32];
     fmt_freq(fb, sizeof(fb), freq_list[a->freq_idx]);
 
     canvas_set_font(c, FontPrimary);
@@ -392,7 +422,7 @@ static void draw_listen(Canvas* c, App* a) {
 }
 
 static void draw_result(Canvas* c, App* a) {
-    char buf[48];
+    char buf[64];
     const Analysis* r = &a->res;
 
     canvas_set_font(c, FontSecondary);
@@ -420,7 +450,8 @@ static void draw_result(Canvas* c, App* a) {
     canvas_draw_str(c, 70, 35, l2);
 
     canvas_set_font(c, FontSecondary);
-    snprintf(buf, sizeof(buf), "%u frames, %u chips, %d%% varies", r->frames, r->len, r->var_pct);
+    snprintf(
+        buf, sizeof(buf), "%u frames, %u chips, %d%% varies", r->frames, r->len, r->var_pct);
     canvas_draw_str(c, 0, 48, buf);
     canvas_draw_str(c, 0, 61, "OK: retry");
     canvas_draw_str_aligned(c, 127, 63, AlignRight, AlignBottom, "Back: menu");
@@ -450,6 +481,7 @@ static void input_cb(InputEvent* event, void* ctx) {
     furi_message_queue_put(a->queue, event, 0);
 }
 
+/* returns false when the app should exit */
 static bool handle_input(App* a, const InputEvent* e) {
     if(e->type != InputTypeShort && e->type != InputTypeRepeat) return true;
     bool keep = true;
@@ -485,7 +517,7 @@ static bool handle_input(App* a, const InputEvent* e) {
             rx_stop(a);
             a->screen = ScreenSetup;
         } else if(e->key == InputKeyOk) {
-            reset_session(a);
+            reset_session(a); /* restart counting */
         }
         break;
 
@@ -506,35 +538,32 @@ static bool handle_input(App* a, const InputEvent* e) {
 static void process_stream(App* a) {
     uint32_t v;
     bool touched = false;
+    furi_mutex_acquire(a->mutex, FuriWaitForever);
     while(a->rx_active && furi_stream_buffer_receive(a->stream, &v, sizeof(v), 0) == sizeof(v)) {
-        furi_mutex_acquire(a->mutex, FuriWaitForever);
         uint8_t before = a->count;
         uint16_t rep = a->repeats;
         handle_pulse(a, (v >> 31) != 0, v & 0x7FFFFFFFu);
         if(a->count != before || a->repeats != rep) touched = true;
-        furi_mutex_release(a->mutex);
     }
+    furi_mutex_release(a->mutex);
     if(touched) view_port_update(a->vp);
 }
 
+/* ------------------------------ main ------------------------------------ */
 int32_t is_it_rolling_app(void* p) {
     UNUSED(p);
 
     App* a = malloc(sizeof(App));
-    if(!a) return -1;
     memset(a, 0, sizeof(App));
-
     a->screen = ScreenSetup;
     a->freq_idx = FREQ_DEFAULT_IDX;
     a->target = DEFAULT_PRESSES;
     a->mutex = furi_mutex_alloc(FuriMutexTypeNormal);
     a->queue = furi_message_queue_alloc(8, sizeof(InputEvent));
-    a->stream = furi_stream_buffer_alloc(2048, 1);
+    a->stream = furi_stream_buffer_alloc(4096, sizeof(uint32_t));
     a->vp = view_port_alloc();
-
     view_port_draw_callback_set(a->vp, draw_cb, a);
     view_port_input_callback_set(a->vp, input_cb, a);
-
     a->gui = furi_record_open(RECORD_GUI);
     gui_add_view_port(a->gui, a->vp, GuiLayerFullscreen);
     a->notif = furi_record_open(RECORD_NOTIFICATION);
