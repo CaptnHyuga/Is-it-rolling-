@@ -1,5 +1,5 @@
 /*
- * Is it rolling ?  -  listen-only Sub-GHz rolling code estimator
+ * Is it rolling ? - listen-only Sub-GHz rolling code estimator
  */
 
 #include <furi.h>
@@ -9,7 +9,6 @@
 #include <input/input.h>
 #include <notification/notification_messages.h>
 
-/* Compatibility fix for header path changes across firmware versions */
 #if __has_include(<lib/subghz/devices/subghz_devices.h>)
 #include <lib/subghz/devices/subghz_devices.h>
 #elif __has_include(<lib/subghz/devices/devices.h>)
@@ -118,9 +117,12 @@ static void rx_start(App* a) {
     subghz_devices_reset(a->device);
     subghz_devices_idle(a->device);
 
-    /* Use OOK650 and 2FSK476 presets */
-    uint32_t preset = a->fm ? FuriHalSubGhzPreset2FSKDev476Async : FuriHalSubGhzPresetOok650Async;
-    subghz_devices_load_preset(a->device, preset, NULL);
+    /* Clean preset loading compliant with current API */
+    if(a->fm) {
+        subghz_devices_load_preset(a->device, FuriHalSubGhzPreset2FSKDev476Async, NULL);
+    } else {
+        subghz_devices_load_preset(a->device, FuriHalSubGhzPresetOok650Async, NULL);
+    }
 
     subghz_devices_set_frequency(a->device, freq);
     subghz_devices_flush_rx(a->device);
