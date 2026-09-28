@@ -16,6 +16,7 @@
 
 #include <furi.h>
 #include <furi_hal.h>
+#include <furi_hal_subghz.h>
 #include <gui/gui.h>
 #include <input/input.h>
 #include <notification/notification_messages.h>
@@ -128,10 +129,10 @@ static void rx_start(App* a) {
     subghz_devices_begin(a->device);
     subghz_devices_reset(a->device);
     subghz_devices_idle(a->device);
-    subghz_devices_load_preset(
-        a->device,
-        a->fm ? FuriHalSubGhzPreset2FSKDev476Async : FuriHalSubGhzPresetOok650Async,
-        NULL);
+
+    uint32_t preset = a->fm ? FuriHalSubGhzPreset2FSKDev476Async : FuriHalSubGhzPresetOok650Async;
+    subghz_devices_load_preset(a->device, preset, NULL);
+
     subghz_devices_set_frequency(a->device, freq);
     subghz_devices_flush_rx(a->device);
     subghz_devices_set_rx(a->device);
