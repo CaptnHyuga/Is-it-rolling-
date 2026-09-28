@@ -3,12 +3,9 @@ App(
     name="Is it rolling ?",
     apptype=FlipperAppType.EXTERNAL,
     entry_point="is_it_rolling_app",
-    requires=["gui", "notification", "subghz"],
+    requires=["gui", "notification"],
     stack_size=4 * 1024,
     fap_category="Sub-GHz",
     fap_version="1.0",
-    fap_icon="icon.png",
     fap_description="Listen-only: press the same remote button N times and estimate if it uses a rolling code.",
-    fap_author="CaptnHyuga",
-    fap_weburl="https://github.com/CaptnHyuga/Is-it-rolling-.git",
 )
